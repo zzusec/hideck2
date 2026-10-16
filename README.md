@@ -21,7 +21,7 @@ HiDeck 是自托管的**高通 4G / LTE / 5G 模组控制台**，在浏览器中
 
 ### 1. 卡级前置代理悬空硬失败 —— 补测试（2026-10-16）
 
-- **位置**：分支 `test/card-proxy-dangling-fail-closed`（commit `7a4e459`，尚未合入 main）
+- **位置**：`internal/device/pool_vowifi_country_proxy_test.go`（commit `7a4e459`，已合入 main）
 - **文件**：`internal/device/pool_vowifi_country_proxy_test.go`（+105 行）
 - **背景**：卡级策略 `card_policies.vowifi_upstream_proxy_id` 指向的代理被删除或禁用后，VoWiFi 启动必须**硬失败**——不允许静默回落国家规则或直连，否则被钉住的出口会悄悄漂移。官方既有测试只覆盖了「代理不存在」一种情况。
 - **内容**：
