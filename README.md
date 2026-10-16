@@ -1,3 +1,53 @@
+# HiDeck2
+
+> **[yibaiba/hideck](https://github.com/yibaiba/hideck) 的个人工作副本** —— 用于承载本地测试与补丁，修改只留在本仓库，不向上游推送。
+>
+> 远端约定：`origin` = 本仓库（提交 / 推送目标）；`upstream` = yibaiba/hideck（仅用于 `git fetch upstream` 同步官方更新，push 已禁用）。
+
+## 这是什么项目
+
+HiDeck 是自托管的**高通 4G / LTE / 5G 模组控制台**，在浏览器中管理 USB 蜂窝模组：
+
+- **设备**：USB 自动发现；QMI / MBIM / AT / PC-SC；射频与 SIM 身份实时状态
+- **代理**：绑定模组的 SOCKS5 / HTTP 出口（`SO_BINDTODEVICE`）
+- **短信**：收件箱、发送、联系人（支持 iOS / Google / 三星 / 小米 / 华为 / OPPO / vivo 的 vcf/csv 导入）
+- **电话 / VoWiFi**：WiFi Calling（SWu / IMS）、蜂窝软件 IMS、原生 VoLTE；**国家前置代理池**（按 SIM 归属国路由 VoWiFi 出口，可钉单节点或强制直连）；通话录音
+- **eSIM**：档案下载、启用 / 停用 / 重命名 / 删除；激活码或二维码 / PDF 导入
+- **自动化与通知**：定时任务；Telegram / 邮件 / Bark / 飞书 / 企业微信 / 微信 / QQ
+
+完整功能、安装方式与协议说明见下方官方 README。
+
+## 相对官方代码的修改
+
+### 1. 卡级前置代理悬空硬失败 —— 补测试（2026-10-16）
+
+- **位置**：分支 `test/card-proxy-dangling-fail-closed`（commit `7a4e459`，尚未合入 main）
+- **文件**：`internal/device/pool_vowifi_country_proxy_test.go`（+105 行）
+- **背景**：卡级策略 `card_policies.vowifi_upstream_proxy_id` 指向的代理被删除或禁用后，VoWiFi 启动必须**硬失败**——不允许静默回落国家规则或直连，否则被钉住的出口会悄悄漂移。官方既有测试只覆盖了「代理不存在」一种情况。
+- **内容**：
+  - `TestResolveCardVoWiFiUpstreamProxyBranches`：六个分支——无策略 / 空值回落、`direct` 强制直连、代理不存在硬失败、代理已禁用硬失败、代理可用
+  - `TestResolveVoWiFiCountryProxyDoesNotFailOpenDisabledPinnedRoute`：钉了「已禁用」代理时不得回落国家规则
+- **运行**：`CGO_ENABLED=0 go test ./internal/device/ -run 'TestResolveCardVoWiFiUpstreamProxyBranches|TestResolveVoWiFiCountryProxy' -v`
+
+### 2. CatBusy 自动恢复补丁 `v2.1.23-catbusy1`（未入库，仅生产二进制部署）
+
+- **状态**：源码未保存在任何仓库；以二进制形式部署在生产机，基于官方 v2.1.23 构建。
+- **背景**：eUICC 里挂着未终结的 CAT/REFRESH 会话时，`EnableProfile` 返回 `catBusy`（SGP.22 result=5）。官方实现只重试 3 次（每次间隔 1s）后放弃，`card_reset_settling` 阶段也只 sleep 约 2.7s、**并不真正复位卡**——卡会永久卡死，只能外部断电复位。
+- **补丁行为**（`internal/esim` 包）：
+  - `enableProfileRecoveringCatBusy` / `disableProfileRecoveringCatBusy`：档案启用 / 停用改走带恢复的流程
+  - `runProfileOpRecoveringCatBusy` → `retryProfileOpWhileCatBusy`：命中 catBusy 时进入 `catbusy_recovery` 阶段重试
+  - `resetSIMForCatBusyRecovery` → `resetATSIMForCatBusy`：通过 AT `CFUN=0` → `CFUN=1` 对模组 / SIM 真实断电-上电
+  - `bringModemOnlineForCatBusyRecovery`：恢复后把模组拉回在线；`recover_attempts` 记录恢复次数
+- **部署方式**（生产机）：
+  - 运行文件 `/opt/hideck/local/hideck`（`chattr +i` 锁定）
+  - 官方升级脚本检测到 `/opt/hideck/KEEP_LOCAL_PATCH` 时直接跳过，不会被覆盖
+  - 恢复官方自动升级：删除 `KEEP_LOCAL_PATCH` → 把 `/etc/init.d/hideck` 的 `command` 改回 `/opt/hideck/hideck` → 执行 `chattr -i /opt/hideck/local/hideck`
+- **现状**：截至 2026-10-16，上游最新代码（main / v2.1.32）仍无真实复位逻辑，补丁仍然必要；源码待按二进制行为重建后再入库。
+
+---
+
+以下为官方 README 原文。
+
 <div align="center">
 
 # HiDeck
