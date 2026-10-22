@@ -379,6 +379,7 @@ const (
 	SwitchPhaseRuntimeRestore      SwitchPhase = "runtime_restore"
 	SwitchPhaseVoWiFiRestore       SwitchPhase = "vowifi_restore"
 	SwitchPhaseTransportRecovering SwitchPhase = "transport_recovering"
+	SwitchPhaseCatBusyRecovery     SwitchPhase = "catbusy_recovery"
 	SwitchPhaseReloadSkipped       SwitchPhase = "reload_skipped"
 	SwitchPhaseReloadWarning       SwitchPhase = "reload_warning"
 	SwitchPhaseDegraded            SwitchPhase = "degraded"
@@ -2787,9 +2788,15 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 	// 是预期信号，后续 finalize 已处理，见 isExpectedCardResetSignal。
 	// CatBusy (result=5) 是瞬态错误：飞行模式切换等操作会导致卡片 CAT 忙碌，
 	// 等待短暂间隔后重试即可恢复。最多重试 3 次，间隔 800ms。
+	//
+	// 本地补丁（catbusy-recovery）：软重试耗尽后，eUICC 里那条未终结的 CAT/REFRESH
+	// 会话不会自愈。此时对 SIM 做一次真实断电-上电（QMI: UIM power cycle /
+	// AT: CFUN=4→1），重建逻辑通道后再试，避免必须人工断电。
 	var enableErr error
 	const maxCatBusyRetries = 3
-	for attempt := 0; attempt <= maxCatBusyRetries; attempt++ {
+	const maxCatBusyRecoveries = 2
+	recoverAttempts := 0
+	for attempt := 0; ; attempt++ {
 		enableErr = client.EnableProfile(iccid, m.switchUseRefreshTrue)
 		if enableErr == nil || !errors.Is(enableErr, sgp22.ErrCatBusy) {
 			break
@@ -2800,7 +2807,45 @@ func (m *Manager) SwitchProfileWithResult(ctx context.Context, targetICCID strin
 				"target", targetICCID,
 				"attempt", fmt.Sprintf("%d/%d", attempt+1, maxCatBusyRetries))
 			time.Sleep(800 * time.Millisecond)
+			continue
 		}
+		if recoverAttempts >= maxCatBusyRecoveries {
+			logger.Error("EnableProfile CatBusy 恢复次数已耗尽",
+				"device", m.deviceID,
+				"target", targetICCID,
+				"recover_attempts", recoverAttempts)
+			break
+		}
+		recoverAttempts++
+		logger.Warn("EnableProfile CatBusy 软重试耗尽，执行 SIM 断电复位后重试",
+			"device", m.deviceID,
+			"target", targetICCID,
+			"recover_attempts", recoverAttempts)
+		m.emitSwitchPhase(operation, switchToken, SwitchPhaseCatBusyRecovery)
+		if err := m.closeLPAClientForOperation("catbusy_recovery", client); err == nil {
+			clientClosed = true
+		}
+		if err := m.forcePostSwitchSIMReload("catbusy_recovery"); err != nil {
+			logger.Error("CatBusy 恢复时 SIM 复位失败",
+				"device", m.deviceID, "target", targetICCID, "err", err)
+			break
+		}
+		reopened, reopenErr := m.createLPAWithAID(targetAID)
+		if reopenErr != nil {
+			logger.Error("CatBusy 恢复后重建 LPA 通道失败",
+				"device", m.deviceID, "target", targetICCID, "err", reopenErr)
+			break
+		}
+		client = reopened
+		clientClosed = false
+		attempt = -1
+	}
+	if recoverAttempts > 0 {
+		logger.Info("EnableProfile CatBusy 恢复结束",
+			"device", m.deviceID,
+			"target", targetICCID,
+			"recover_attempts", recoverAttempts,
+			"result", fmt.Sprintf("%v", enableErr))
 	}
 
 	// 在模组重启前主动关闭 LPA 逻辑通道（AT+CCHC）
@@ -2937,7 +2982,56 @@ func (m *Manager) DisableProfile(ctx context.Context, targetICCID string, aidHex
 		return fmt.Errorf("等待禁用 profile APDU barrier 失败: %w", err)
 	}
 
-	disableErr := client.DisableProfile(iccid, true)
+	// 本地补丁（catbusy-recovery）：DisableProfile 同样可能撞上 eUICC 里未终结的
+	// CAT/REFRESH 会话。先软重试，仍为 CatBusy 时对 SIM 断电-上电并重建通道再试。
+	var disableErr error
+	const maxDisableCatBusyRetries = 3
+	const maxDisableCatBusyRecoveries = 2
+	disableRecoverAttempts := 0
+	for attempt := 0; ; attempt++ {
+		disableErr = client.DisableProfile(iccid, true)
+		if disableErr == nil || !errors.Is(disableErr, sgp22.ErrCatBusy) {
+			break
+		}
+		if attempt < maxDisableCatBusyRetries {
+			logger.Warn("DisableProfile 返回 CatBusy，卡片 CAT 忙碌中，等待后重试",
+				"device", m.deviceID,
+				"target", targetICCID,
+				"attempt", fmt.Sprintf("%d/%d", attempt+1, maxDisableCatBusyRetries))
+			time.Sleep(800 * time.Millisecond)
+			continue
+		}
+		if disableRecoverAttempts >= maxDisableCatBusyRecoveries {
+			logger.Error("DisableProfile CatBusy 恢复次数已耗尽",
+				"device", m.deviceID,
+				"target", targetICCID,
+				"recover_attempts", disableRecoverAttempts)
+			break
+		}
+		disableRecoverAttempts++
+		logger.Warn("DisableProfile CatBusy 软重试耗尽，执行 SIM 断电复位后重试",
+			"device", m.deviceID,
+			"target", targetICCID,
+			"recover_attempts", disableRecoverAttempts)
+		m.emitSwitchPhase(operation, switchToken, SwitchPhaseCatBusyRecovery)
+		if err := m.closeLPAClientForOperation("disable_catbusy_recovery", client); err == nil {
+			clientClosed = true
+		}
+		if err := m.forcePostSwitchSIMReload("catbusy_recovery"); err != nil {
+			logger.Error("CatBusy 恢复时 SIM 复位失败",
+				"device", m.deviceID, "target", targetICCID, "err", err)
+			break
+		}
+		reopened, reopenErr := m.createLPAWithAID(targetAID)
+		if reopenErr != nil {
+			logger.Error("CatBusy 恢复后重建 LPA 通道失败",
+				"device", m.deviceID, "target", targetICCID, "err", reopenErr)
+			break
+		}
+		client = reopened
+		clientClosed = false
+		attempt = -1
+	}
 	if err := m.closeLPAClientForOperation("disable_profile_pre_refresh", client); err == nil {
 		clientClosed = true
 	}
